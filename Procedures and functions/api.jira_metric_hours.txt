@@ -1,0 +1,37 @@
+-- PROCEDURE: api.jira_metric_hours()
+
+-- DROP PROCEDURE api.jira_metric_hours();
+
+CREATE OR REPLACE PROCEDURE api.jira_metric_hours(
+	)
+LANGUAGE 'plpgsql'
+AS $BODY$
+begin
+
+	DELETE FROM api.jira_raw_rig_sprint;
+
+    INSERT INTO api.jira_raw_rig_sprint
+        (
+        lob ,
+        application_name,
+		team_name,
+		riglet_name,
+        project_key,
+        sprint ,
+			issue_id,
+        sprint_completion_date,		
+        lead_time
+        )		
+    SELECT lob,application_name,team_name,riglet_name,project_key, sprint,issue_id, sprint_completion_date::DATE ,
+	 (round(EXTRACT(epoch from(done::timestamp - created_date::timestamp)/3600))) 
+	from api.jira_raw_rig d
+	where 
+	d.status = 'Done'
+	and d.issue_type = 'Story'
+	and sprint_completion_date <> ''
+	and sprint_completion_date is not null
+
+ORDER by lob ,application_name ,team_name, riglet_name desc;
+		
+end;
+$BODY$;

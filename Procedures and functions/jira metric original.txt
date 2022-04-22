@@ -1,0 +1,153 @@
+-- PROCEDURE: public.jira_metric()
+
+-- DROP PROCEDURE public.jira_metric();
+
+CREATE OR REPLACE PROCEDURE public.jira_metric(
+	)
+LANGUAGE 'plpgsql'
+AS $BODY$
+begin
+
+	DELETE FROM jira_metric_per_sprint;
+	DELETE FROM jira_metric_per_day;
+
+    INSERT INTO jira_metric_per_sprint
+        (
+        lob ,
+        cfu ,
+        application_name ,
+        application_id ,
+        project_key,
+        sprint ,
+        sprint_completion_date ,
+        story_spill_over ,
+        commitment_adherence,
+        lead_time,
+        cycle_time,
+        committed_story_points,
+        velocity,
+        velocity_consistency,
+        defect_rate
+        )
+    SELECT a.lob , a.cfu , a.application_name , a.application_id, a.project_key, a.sprint, a.sprint_completion_date::DATE ,
+        coalesce((a.total_story_count - (SELECT count(issue_id) FROM api.jira_raw c 
+        WHERE  c.application_name = a.application_name
+        AND c.application_id = a.application_id
+        AND c.sprint = a.sprint
+        AND c.status = 'Done'
+        AND c.issue_type = 'Story')),0) story_spill_over,
+        coalesce((CASE WHEN  a.total_story_point_sum <> 0 THEN round((select sum(coalesce(story_point,0)) 
+from api.jira_raw c where  c.application_name = a.application_name
+and c.application_id = a.application_id
+and c.sprint = a.sprint
+and c.status = 'Done'
+and c.issue_type = 'Story')/a.total_story_point_sum::NUMERIC ,2) 
+ELSE 0
+END )*100,0) commitment_adherence,
+        coalesce((select trunc(sum(extract(day from (done::timestamp - created_date::timestamp)))/count(issue_id)) from api.jira_raw d
+where d.application_name = a.application_name
+and d.application_id = a.application_id
+and d.sprint = a.sprint
+and d.status = 'Done'
+and d.issue_type = 'Story'),0) lead_time,
+        coalesce((select trunc(sum(case when (in_progress is null or in_progress = '') then
+0 else
+extract(day from (done::timestamp - in_progress::timestamp))
+end)/count(issue_id)) from api.jira_raw e
+where e.application_name = a.application_name
+and e.application_id = a.application_id
+and e.sprint = a.sprint
+and e.status = 'Done'
+and e.issue_type = 'Story'),0) cycle_time,
+        coalesce(a.total_story_point_sum,0) committed_story_points,
+        velocity,
+        CASE WHEN velocity_avg <> 0 THEN ABS((1 - ABS(round((velocity_avg - velocity)/velocity_avg,2)))*100) 
+ELSE 0 END as velocity_consistency,
+        coalesce((select count(issue_id) from api.jira_raw c 
+        where c.application_name = a.application_name
+and c.application_id = a.application_id
+and c.sprint = a.sprint
+and c.issue_type = 'Bug'
+and c.defect = true
+and c.priority <> 'Low'
+and c.priority <> 'Lowest'),0) defect_rate
+    from
+        (SELECT lob , cfu , application_name , application_id, project_key, sprint, sprint_completion_date , count(issue_id) as total_story_count, sum(coalesce(story_point,0)) as total_story_point_sum
+        FROM api.jira_raw
+        GROUP by lob ,cfu ,application_name ,application_id, project_key,sprint ,sprint_completion_date, issue_type
+        HAVING sprint_completion_date <> 'null' and issue_type = 'Story'
+        ORDER by lob ,cfu ,application_name ,application_id, sprint, sprint_completion_date ) a,
+        LATERAL(
+    SELECT (coalesce((select sum(coalesce(story_point,0)) 
+from api.jira_raw f where  f.application_name = a.application_name
+and f.application_id = a.application_id
+and f.sprint = a.sprint
+and f.status = 'Done'
+and f.issue_type = 'Story'),0)), (SELECT i.*
+        from
+            (SELECT coalesce(round(avg(g.velocity),2),0) as velocity_avg
+            FROM
+                (SELECT h.lob , h.cfu , h.application_name , h.application_id, h.project_key, h.sprint, h.sprint_completion_date::DATE ,
+                    coalesce((select sum(coalesce(story_point,0)) 
+from api.jira_raw f 
+where  f.application_name = h.application_name
+and f.application_id = h.application_id
+and f.sprint = h.sprint
+and f.status = 'Done'
+and f.issue_type = 'Story'),0) velocity
+                from
+                    (SELECT lob , cfu , application_name , application_id, project_key, sprint, sprint_completion_date
+                    FROM api.jira_raw
+                    GROUP by lob ,cfu ,application_name ,application_id, project_key,sprint ,sprint_completion_date, issue_type
+                    HAVING sprint_completion_date <> 'null' and issue_type = 'Story') h
+                where sprint_completion_date < a.sprint_completion_date
+                GROUP by h.lob ,h.cfu ,h.application_name ,h.application_id,h.project_key,h.sprint ,h.sprint_completion_date
+                ORDER by lob ,cfu ,application_name ,application_id, sprint_completion_date desc
+LIMIT 4) g ) i )) as s1
+    (velocity, velocity_avg)
+WHERE a.sprint_completion_date::DATE 
+    NOT IN
+    (SELECT sprint_completion_date::DATE
+    from jira_metric_per_sprint
+    WHERE sprint_completion_date <> 'null'
+        AND application_name = a.application_name
+        AND application_id = a.application_id);
+
+    INSERT INTO jira_metric_per_day
+        (
+        lob,
+        cfu,
+        application_name,
+        application_id,
+        project_key,
+        metric_date,
+        defect_aging
+        )
+    SELECT a.lob , a.cfu , a.application_name , a.application_id, a.project_key, a.metric_date,
+        (SELECT round(coalesce(avg(extract(day from (a.metric_date::timestamp - created_date::timestamp))),0)::numeric, 2)
+    FROM api.jira_raw
+    WHERE a.application_name = application_name
+        AND a.application_id = application_id
+        AND issue_type = 'Bug'
+        AND defect = true
+        and priority <> 'Low'
+        and priority <> 'Lowest'
+        AND created_date::date <= a.metric_date
+        AND (done = null OR done = '' OR done::date < a.metric_date )
+    ) defect_aging
+FROM
+    (SELECT lob , cfu , application_name , application_id, project_key,
+        (generate_series((SELECT min(created_date)::date
+        FROM api.jira_raw), current_date, '1 day'
+    ::interval))::date as metric_date
+FROM api.jira_raw 
+GROUP by lob ,cfu ,application_name ,application_id, project_key ) a
+WHERE a.metric_date 
+    NOT IN
+    (SELECT metric_date
+    from jira_metric_per_day
+    WHERE application_name = a.application_name
+        AND application_id = a.application_id);
+
+end;
+$BODY$;
